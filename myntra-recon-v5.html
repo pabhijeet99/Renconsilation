@@ -1075,6 +1075,7 @@ async function reconcile() {
     // Forward  formula: comm + igst + cgst + sgst + tds + logistics + settled + marketing  (all +)
     // Reverse  formula: -(comm + igst + cgst + sgst + tds - logistics - settled + marketing) × -1
     //                  → logistics and settled FLIP SIGN vs forward before the ×-1
+    customer_paid_amt:    ['customer_paid_amt','Customer Paid Amt','customer paid amt','CustomerPaidAmt','customer_paid','paid_amount'],
     commission:           ['Commission','commission'],
     igst_tcs:             ['IGST_TCS','IGST TCS','igst_tcs'],
     cgst_tcs:             ['CGST_TCS','CGST TCS','cgst_tcs'],
@@ -1227,52 +1228,54 @@ async function reconcile() {
     const ori  = normOri(fv(r, payC.order_release_id));  // normOri: '8679812991.0'→'8679812991'
     const soid = norm(fv(r, payC.seller_order_id));
 
-    // Detect Reverse / Return rows by Order_Type column.
-    // For reverse rows the Settled_Amount is stored as NEGATIVE in source data
-    // but must be ADDED AS POSITIVE in the component formula (user confirmed).
+    // Classify row: Reverse vs Forward/NOD (Forward and NOD use the same formula).
     const orderType = payC.order_type ? fv(r, payC.order_type).toLowerCase() : '';
     const isReverse = orderType !== '' &&
-      ['reverse', 'return', 'nod', 'rto', 'rev'].some(t => orderType.includes(t));
+      ['reverse', 'return', 'rto', 'rev'].some(t => orderType.includes(t));
 
-    // Use 'Final' column directly (preferred) — it's ROUND(SUM(G+H+I+J+L+Q+R+AO),1).
-    // Fall back to summing components if 'Final' column is absent.
+    // All component values taken as absolute (handles +/− storage conventions).
+    //
+    // Forward / NOD : |Comm|+|IGST|+|CGST|+|SGST|+|TDS| + |Logi| + |Settled| + |Mktg|
+    //                 → always positive → ADDED to running total
+    //
+    // Reverse       : |Comm|+|IGST|+|CGST|+|SGST|+|TDS| − |Logi| − |Settled| + |Mktg|
+    //                 → SUBTRACTED from running total
+    //                 → capped at MAX(0, …): if formula < 0, deduct nothing
+    //
+    // Example (all abs = 1):
+    //   Forward = 1+1+1+1+1+1 = 6   NOD = 6   Reverse = 1+1+1−1−1+1 = 2
+    //   Net = 6 + 6 − 2 = 10
     const hasComponents = payC.commission || payC.igst_tcs || payC.settled || payC.logistics_commission;
-    let amount;
+    let amount = 0;
+
     if (payC.final_payment) {
-      // 'Final' column already computed (preferred) — direct use
-      amount = fn(r, payC.final_payment);
-      // If Final = 0 but components exist, compute manually (handles files without pre-computed Final)
-      if (amount === 0 && hasComponents) {
-        const comm = fn(r, payC.commission);
-        const igst = fn(r, payC.igst_tcs);
-        const cgst = fn(r, payC.cgst_tcs);
-        const sgst = fn(r, payC.sgst_tcs);
-        const tds  = fn(r, payC.tds);
-        const logi = fn(r, payC.logistics_commission);
-        const sett = fn(r, payC.settled);
-        const mktg = fn(r, payC.marketing_charges);
-        // Reverse rows: Settled_Amount must ALWAYS be subtracted, irrespective of sign.
-        // -Math.abs(sett) ensures it is always negative (deducted) whether sett is +ve or -ve.
-        const effectiveSett = isReverse ? -Math.abs(sett) : sett;
-        amount = Math.round((comm + igst + cgst + sgst + tds + logi + effectiveSett + mktg) * 10) / 10;
-      }
+      // Pre-computed Final column present — take abs (reference Final = MAX(0, FinalPayment)).
+      amount = Math.round(Math.abs(fn(r, payC.final_payment)) * 10) / 10;
     } else if (hasComponents) {
-      const comm = fn(r, payC.commission);
-      const igst = fn(r, payC.igst_tcs);
-      const cgst = fn(r, payC.cgst_tcs);
-      const sgst = fn(r, payC.sgst_tcs);
-      const tds  = fn(r, payC.tds);
-      const logi = fn(r, payC.logistics_commission);
-      const sett = fn(r, payC.settled);
-      const mktg = fn(r, payC.marketing_charges);
-      // Reverse rows: Settled_Amount must ALWAYS be subtracted, irrespective of sign.
-      // -Math.abs(sett) ensures it is always negative (deducted) whether sett is +ve or -ve.
-      const effectiveSett = isReverse ? -Math.abs(sett) : sett;
-      amount = Math.round((comm + igst + cgst + sgst + tds + logi + effectiveSett + mktg) * 10) / 10;
-    } else {
-      amount = 0;
+      const comm = Math.abs(fn(r, payC.commission));
+      const igst = Math.abs(fn(r, payC.igst_tcs));
+      const cgst = Math.abs(fn(r, payC.cgst_tcs));
+      const sgst = Math.abs(fn(r, payC.sgst_tcs));
+      const tds  = Math.abs(fn(r, payC.tds));
+      const logi = Math.abs(fn(r, payC.logistics_commission));
+      const sett = Math.abs(fn(r, payC.settled));
+      const mktg = Math.abs(fn(r, payC.marketing_charges));
+
+      if (isReverse) {
+        // Reverse: comm+igst+cgst+sgst+tds − logi − settled + mktg
+        // Accumulated directly — negative when settled dominates (as expected).
+        // Net = Forward + NOD + reverseAmt  e.g. 1000 + 0 + (−1000) = 0
+        const reverseAmt = comm + igst + cgst + sgst + tds - logi - sett + mktg;
+        amount = Math.round(reverseAmt * 10) / 10;
+      } else {
+        // Forward / NOD: comm+igst+cgst+sgst+tds + logi + settled + mktg  → positive.
+        const forwardAmt = comm + igst + cgst + sgst + tds + logi + sett + mktg;
+        amount = Math.max(0, Math.round(forwardAmt * 10) / 10);
+      }
     }
-    // Accumulate NET (forward + reverse) — matches Sheet7 Sum of Final
+
+    // Accumulate per ORI and per Seller Order ID.
+    // Forward/NOD → positive (adds).  Reverse → negative or 0 (deducts or neutral).
     if (amount !== 0) {
       if (ori)  payByOri.set(ori,   (payByOri.get(ori)   || 0) + amount);
       if (soid) payBySOID.set(soid, (payBySOID.get(soid) || 0) + amount);
